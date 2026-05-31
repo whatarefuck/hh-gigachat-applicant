@@ -18,6 +18,8 @@ from typing import Any, Callable, Iterable
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from . import ai, api, utils
 from .constants import (
@@ -31,6 +33,7 @@ from .constants import (
 from .storage import StorageFacade
 from .utils.cookiejar import HHOnlyCookieJar
 from .utils.log import setup_logger
+from .utils.notifications import init_sentry
 from .utils.mixins import MegaTool
 
 logger = logging.getLogger(__package__)
@@ -191,6 +194,25 @@ class HHApplicantTool(MegaTool):
             session.proxies = proxies
 
         session.headers.update({"User-Agent": DESKTOP_USER_AGENT})
+
+        # Устойчивость к обрывам сети (wifi reconnect, смена соединения):
+        # авто-ретраи на connection/read-ошибках и 5xx с экспоненциальным
+        # backoff. allowed_methods=None → ретраить все методы, включая POST
+        # (обрыв обычно означает, что запрос не дошёл — повтор безопасен;
+        # дубль-отклик HH отсекает на своей стороне).
+        retry = Retry(
+            total=6,
+            connect=6,
+            read=3,
+            backoff_factor=2.0,  # паузы 0,2,4,8,16,32с — ~минута на reconnect
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=None,
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
         return session
 
     @cached_property
@@ -322,32 +344,64 @@ class HHApplicantTool(MegaTool):
                 f"Сессионные куки имеют неправильный тип: {type(self.session.cookies)}"
             )
 
-    def get_cover_letter_ai(self, system_prompt: str) -> ai.ChatOpenAI:
+    def get_cover_letter_ai(self, system_prompt: str) -> ai.ChatAI:
         return self._init_ai_client(system_prompt, purpose="cover_letter")
 
-    def get_vacancy_filter_ai(self, system_prompt: str) -> ai.ChatOpenAI:
+    def get_vacancy_filter_ai(self, system_prompt: str) -> ai.ChatAI:
         return self._init_ai_client(system_prompt, purpose="vacancy_filter")
 
-    def get_captcha_ai(self) -> ai.ChatOpenAI:
-        return self._init_ai_client(system_prompt="Что написано на картинке?", purpose="captcha")
+    def get_captcha_ai(self) -> ai.ChatAI:
+        # solve_captcha не использует system_prompt — у клиентов свой внутренний промпт.
+        return self._init_ai_client(system_prompt="", purpose="captcha")
 
-    def _init_ai_client(self, system_prompt: str, purpose: str) -> ai.ChatOpenAI:
+    def _init_ai_client(self, system_prompt: str, purpose: str) -> ai.ChatAI:
 
         config_sections = {
             "cover_letter": "openai_cover_letter",
             "vacancy_filter": "openai_vacancy_filter",
             "captcha": "openai_captcha",
         }
-        
+
         if purpose not in config_sections:
             raise ValueError(
                 f"Неизвестная цель AI: {purpose}. "
                 f"Допустимые значения: {list(config_sections.keys())}"
             )
-        
+
         config_section = config_sections[purpose]
         c = self.config.get(config_section, {})
-        
+
+        provider = (c.get("provider") or "openai").lower()
+
+        if provider == "openai":
+            return self._build_openai_client(
+                c, system_prompt=system_prompt, config_section=config_section
+            )
+        if provider == "gigachat":
+            if purpose == "captcha":
+                model = c.get("model", "")
+                if model and not any(
+                    tag in model for tag in ("Pro", "Max")
+                ):
+                    logger.warning(
+                        "GigaChat captcha vision требует Pro/Max-модель "
+                        "(GigaChat-Pro, GigaChat-Max, GigaChat-2-Pro, "
+                        "GigaChat-2-Max). Текущая модель %r может вернуть "
+                        "ошибку.",
+                        model,
+                    )
+            return self._build_gigachat_client(
+                c, system_prompt=system_prompt, config_section=config_section
+            )
+
+        raise ValueError(
+            f"Неизвестный AI-провайдер: {provider!r}. "
+            "Поддерживаются: openai, gigachat"
+        )
+
+    def _build_openai_client(
+        self, c: dict, *, system_prompt: str, config_section: str
+    ) -> ai.ChatOpenAI:
         api_key = c.get("api_key")
         if not api_key:
             raise ValueError(
@@ -371,7 +425,7 @@ class HHApplicantTool(MegaTool):
                 "Примеры: 'gpt-4o-mini', 'gpt-3.5-turbo', 'openai/gpt-4'",
                 config_section,
             )
-    
+
         return ai.ChatOpenAI(
             api_key=api_key,
             model=model,
@@ -382,6 +436,88 @@ class HHApplicantTool(MegaTool):
             rate_limit=c.get("rate_limit", 40),
             session=self.openai_session,
         )
+
+    def _build_gigachat_client(
+        self, c: dict, *, system_prompt: str, config_section: str
+    ) -> ai.ChatAI:
+        accounts = self._collect_gigachat_accounts(c, config_section)
+        if not accounts:
+            raise ValueError(
+                f"GigaChat credentials не заданы. Заполни пул через "
+                f"`hh-applicant-tool gigachat-accounts add ...` или укажи "
+                f"'credentials' в секции '{config_section}'."
+            )
+
+        common_kwargs: dict = {
+            "model": c.get("model", "GigaChat"),
+            "temperature": c.get("temperature", 0.0),
+            "max_completion_tokens": c.get("max_completion_tokens", 1000),
+            "system_prompt": system_prompt,
+            "rate_limit": c.get("rate_limit", 40),
+            "session": self.openai_session,
+        }
+        if c.get("base_url"):
+            common_kwargs["base_url"] = c["base_url"]
+        if c.get("auth_url"):
+            common_kwargs["auth_url"] = c["auth_url"]
+
+        clients = [
+            ai.ChatGigaChat(
+                credentials=acc["credentials"],
+                scope=acc.get("scope") or "GIGACHAT_API_PERS",
+                **common_kwargs,
+            )
+            for acc in accounts
+        ]
+        labels = [acc.get("label") or f"#{i + 1}" for i, acc in enumerate(accounts)]
+
+        if len(clients) == 1:
+            return clients[0]
+
+        logger.info(
+            "GigaChat pool (%s): %d аккаунтов — %s",
+            config_section,
+            len(clients),
+            ", ".join(labels),
+        )
+        return ai.GigaChatPool(clients, labels=labels)
+
+    def _collect_gigachat_accounts(
+        self, c: dict, config_section: str
+    ) -> list[dict]:
+        accounts: list[dict] = []
+        seen_creds: set[str] = set()
+
+        # 1) Глобальный пул gigachat.accounts на верхнем уровне
+        gigachat_cfg = self.config.get("gigachat") or {}
+        if isinstance(gigachat_cfg, dict):
+            for entry in gigachat_cfg.get("accounts") or []:
+                if not isinstance(entry, dict):
+                    continue
+                creds = entry.get("credentials")
+                if not creds or creds in seen_creds:
+                    continue
+                seen_creds.add(creds)
+                accounts.append(
+                    {
+                        "credentials": creds,
+                        "scope": entry.get("scope"),
+                        "label": entry.get("label"),
+                    }
+                )
+
+        # 2) Bаckwards-compat: single credentials прямо в purpose-секции
+        section_creds = c.get("credentials")
+        if section_creds and section_creds not in seen_creds:
+            accounts.append(
+                {
+                    "credentials": section_creds,
+                    "scope": c.get("scope"),
+                    "label": f"{config_section}.credentials",
+                }
+            )
+
+        return accounts
 
     # TODO: вынести в миксин какой
     def _extract_xsrf_token(self, content: str) -> str:
@@ -448,6 +584,7 @@ class HHApplicantTool(MegaTool):
         )
 
         setup_logger(logger, verbosity_level, self.log_file)
+        init_sentry(self.config)
 
         logger.debug("Путь до профиля: %s", self.config_path)
 

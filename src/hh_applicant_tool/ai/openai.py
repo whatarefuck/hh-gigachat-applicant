@@ -99,10 +99,8 @@ class ChatOpenAI:
         """Генерация текста через OpenAI API"""
         messages = []
 
-        # Добавляем системный промпт только если он не пустой и не None
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
-        # Пользовательское сообщение всегда обязательно
         messages.append({"role": "user", "content": message})
 
         # Логирование запроса к AI при DEBUG уровне
@@ -156,8 +154,11 @@ class ChatOpenAI:
 
         raise OpenAIError("OpenAI request failed after retries")
 
-    # Этому методу тут не место. Мы решаем капчу hh.ru, а тут методы для OpenAI
     def solve_captcha(self, image_data: bytes) -> str:
+        """Распознаёт текст с изображения капчи hh.ru через OpenAI Vision.
+
+        Использует собственный system-prompt, поле `self.system_prompt` игнорируется.
+        """
         image_base64 = base64.b64encode(image_data).decode("utf-8")
 
         content_type = "image/png"
