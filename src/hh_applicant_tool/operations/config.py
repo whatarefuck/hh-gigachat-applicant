@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import platform
+import shlex
 import subprocess
 from typing import TYPE_CHECKING, Any
 
@@ -140,12 +141,22 @@ class Operation(BaseOperation):
         print(json.dumps(config, indent=2, ensure_ascii=False))
 
     def _open_editor(self, filepath: str) -> None:
-        """Открывает файл в редакторе по умолчанию в зависимости от ОС."""
+        """Открывает конфиг в редакторе.
+
+        Приоритет: $VISUAL / $EDITOR (на всех ОС) — например, `zed --wait`,
+        `code --wait`, `nvim`. Если не заданы — дефолт ОС: `open` (macOS),
+        `os.startfile` (Windows), `xdg-open` (Linux).
+        """
+        editor = os.getenv("VISUAL") or os.getenv("EDITOR")
+        if editor:
+            # Поддерживаем флаги в значении, напр. EDITOR="zed --wait".
+            subprocess.run([*shlex.split(editor), filepath], check=True)
+            return
+
         match platform.system():
             case "Windows":
                 os.startfile(filepath)
             case "Darwin":  # macOS
                 subprocess.run(["open", filepath], check=True)
-            case _:  # Linux и остальные (аналог else)
-                editor = os.getenv("EDITOR", "xdg-open")
-                subprocess.run([editor, filepath], check=True)
+            case _:  # Linux и остальные
+                subprocess.run(["xdg-open", filepath], check=True)

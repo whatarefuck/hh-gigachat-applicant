@@ -4,5 +4,6 @@
   "[shellscript]": {
     "editor.defaultFormatter": null,
     "editor.formatOnSave": false
-  }
+  },
+  "cursorpyright.analysis.autoImportCompletions": true
 }
