@@ -5,15 +5,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    volumes:
-      - .:/app
-      # Пробрасываем таймзону хоста
-      - /etc/localtime:/etc/localtime:ro
     restart: unless-stopped
+    volumes:
+      # Конфиг и БД хранятся на хосте — переживут пересборки образа.
+      # Внутри контейнера CONFIG_DIR=/app/config (см. env ниже и Dockerfile).
+      - ./config:/app/config
+      # Таймзона хоста (чтобы cron в контейнере работал в твоё время).
+      - /etc/localtime:/etc/localtime:ro
     environment:
-      # Это не трогаем
+      # Папка для config.json / hh.sqlite / cookies.txt внутри контейнера.
       - CONFIG_DIR=/app/config
-      # Смените или закомментируйте при проблемах
-      - TERM=${TERM}
-      # Если время на сервере отличается
+      # Терминал нужен для kitty/sixel-вывода (можно закомментировать).
+      - TERM=${TERM:-xterm}
+      # Если время сервера отличается от Москвы — раскомментируй:
       # - TZ=Europe/Moscow
+    # Поднимать веб-UI наружу не обязательно: всё работает через cron внутри.
+    # Если нужен UI — раскомментируй и используй команду `ui` вместо cron.
+    # ports:
+    #   - "127.0.0.1:8000:8000"
