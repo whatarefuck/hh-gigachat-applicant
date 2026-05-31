@@ -556,6 +556,4 @@ Limited Non-Commercial License. См. файл `LICENSE`.
 
 Бесплатно для личного использования. Коммерческое использование —
 включая интеграцию в платные сервисы или перепродажу — запрещено.
-
-Канал и чат проекта: [@hh_applicant_tool](https://t.me/hh_applicant_tool),
-[@hh_applicant_chat](https://t.me/hh_applicant_chat).
+Based on github.com/s3rgeym/hh-applicant-tool
