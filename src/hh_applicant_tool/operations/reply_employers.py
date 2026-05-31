@@ -3,17 +3,18 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from ..ai.base import AIError
+import requests
+
 from ..api import ApiError, datatypes
 from ..main import BaseNamespace, BaseOperation
 from ..utils.date import parse_api_datetime
 from ..utils.string import rand_text
 
 if TYPE_CHECKING:
-    from ..ai.openai import ChatOpenAI
     from ..main import HHApplicantTool
 
 
@@ -39,6 +40,10 @@ class Namespace(BaseNamespace):
     system_prompt: str
     message_prompt: str
     period: int
+    delete_discarded: bool
+    delete_blacklisted: bool
+    watch: bool
+    interval: int
 
 
 class Operation(BaseOperation):
@@ -84,6 +89,20 @@ class Operation(BaseOperation):
             action=argparse.BooleanOptionalAction,
         )
         parser.add_argument(
+            "--delete-discarded",
+            "--delete-rejected",
+            help="Отменять отклик и удалять чат, если работодатель отказал (state=discard)",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--delete-blacklisted",
+            "--delete-blocked",
+            help="Отменять отклик и удалять чат с работодателями из чёрного списка",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
             "--use-ai",
             "--ai",
             help="Использовать AI для автоматической генерации ответов",
@@ -93,13 +112,52 @@ class Operation(BaseOperation):
             "--system-prompt",
             "--ai-system",
             help="Системный промпт для AI",
-            default="Ты — соискатель на HeadHunter. Отвечай вежливо и кратко.",
+            default=(
+                "Ты — соискатель, отвечаешь работодателю в чате HeadHunter на его сообщение. "
+                "Текст уйдёт работодателю как есть, без редактуры.\n\n"
+                "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО:\n"
+                "— Эмодзи и любые символы-смайлы: 🤔 😎 🚀 ✅ 👋 ⚡ и подобные. Ни одного.\n"
+                "— Восклицательные знаки. Только точки и запятые.\n"
+                "— Приветствия «Привет», «Здравствуйте», «Хай», «Добрый день», «Уважаемый HR» (если в начале переписки — допустимо одно нейтральное «Здравствуйте»).\n"
+                "— Самопрезентации именем: «X здесь», «Меня зовут X», «X на связи», «Привет, я X». Имя из контекста — это справочные данные для тебя, в текст не вставляй.\n"
+                "— Любые упоминания себя в третьем лице («Байназар обсудит», «у Байназара есть опыт»). Пиши ТОЛЬКО от первого лица: «я обсужу», «у меня есть опыт».\n"
+                "— Подписи «С уважением», «С наилучшими пожеланиями», «Жду ответа», «Жду обратной связи».\n"
+                "— Молодёжно-расслабленные обороты: «прям», «зацепило», «не смог удержаться», «крутая», «классный».\n"
+                "— Канцелярит: «выражаю заинтересованность», «имею честь», «являюсь», «обладаю», «осуществляю».\n"
+                "— AI-штампы: «ключевой», «значительный опыт», «глубокие знания», «активный участник», «динамично развивающаяся», «реальную пользу», «новые вызовы».\n"
+                "— Реверансы: «с удовольствием», «благодарю за внимание», «буду рад возможности обсудить», «надеюсь на сотрудничество».\n"
+                "— Деепричастные обороты на старте предложений («являясь...», «обладая...», «имея...»).\n"
+                "— Длинное тире. Только обычные точки, запятые, двоеточия.\n"
+                "— Квадратные скобки и плейсхолдеры вида [имя]/[компания].\n"
+                "— Самохвалебные общие фразы «готов влиться в команду», «достаточно знаний и опыта».\n\n"
+                "КАК ОТВЕЧАТЬ:\n"
+                "— Сначала прочитай последнее сообщение работодателя и ответь именно на него — не уводи разговор в сторону.\n"
+                "— Длина: 1-3 коротких предложения. Если работодатель задал конкретный вопрос — отвечай по делу.\n"
+                "— Если работодатель пригласил/предложил созвон/просит контакты — соглашайся, дай нужные данные.\n"
+                "— Тон: спокойный, уверенный, профессиональный взрослый разработчик. Не «парень в чате», не пафосный, не угодливый.\n"
+                "— Пиши от первого лица. На «вы».\n"
+                "— Опирайся на конкретику из переписки и из контекста о кандидате."
+            ),
         )
         parser.add_argument(
             "--message-prompt",
             "--prompt",
             help="Промпт для генерации сообщения",
-            default="Напиши короткий ответ работодателю на основе истории переписки.",
+            default="Ответь на последнее сообщение работодателя на основе истории переписки ниже.",
+        )
+        parser.add_argument(
+            "--watch",
+            "--loop",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Live-режим: бесконечно опрашивать чаты с паузой --interval. "
+            "Остановка по Ctrl+C.",
+        )
+        parser.add_argument(
+            "--interval",
+            type=int,
+            default=300,
+            help="Пауза между прогонами в секундах для --watch (по умолчанию 300).",
         )
 
     def run(self, tool: HHApplicantTool, args: Namespace) -> None:
@@ -112,13 +170,169 @@ class Operation(BaseOperation):
         self.max_pages = args.max_pages
         self.dry_run = args.dry_run
         self.only_invitations = args.only_invitations
+        self.delete_discarded = args.delete_discarded
+        self.delete_blacklisted = args.delete_blacklisted
 
         self.message_prompt = args.message_prompt
-        self.cover_letter_ai = (tool.get_cover_letter_ai(args.system_prompt) if args.use_ai else None)
+
+        effective_system_prompt = self._build_effective_system_prompt(
+            args.system_prompt
+        )
+
+        self.cover_letter_ai = (
+            tool.get_cover_letter_ai(effective_system_prompt)
+            if args.use_ai
+            else None
+        )
         self.period = args.period
 
         logger.debug(f"{self.reply_message = }")
-        self.reply_employers()
+
+        if not args.watch:
+            self.reply_employers()
+            return
+
+        interval = max(30, args.interval)
+        logger.info(
+            "Live-режим reply-employers: интервал ~%dс. Ctrl+C для остановки.",
+            interval,
+        )
+        print(
+            f"👀 Live-режим: проверяю чаты каждые ~{interval}с. "
+            "Останови через Ctrl+C."
+        )
+        while True:
+            try:
+                self.reply_employers()
+            except (ApiError, requests.exceptions.RequestException) as ex:
+                # API-сбои и обрывы сети (если ретраи сессии исчерпаны при
+                # долгом отключении wifi) не должны ронять watch-цикл.
+                logger.error("Ошибка прогона reply-employers: %s", ex)
+            # Случайный джиттер ±20%, чтобы не выглядеть роботом.
+            sleep_for = interval * random.uniform(0.8, 1.2)
+            logger.debug("Сплю %.0fс до следующего прогона", sleep_for)
+            time.sleep(sleep_for)
+
+    def _build_effective_system_prompt(self, base_prompt: str) -> str:
+        """Подмешивает в system-prompt био и FAQ-ответы из конфига.
+
+        Дублирует логику из apply_vacancies — даёт модели тот же контекст
+        при ответах в чате (имя, опыт, вилка, готовность к выходу и т.п.).
+        """
+
+        def clean(value: object) -> str:
+            return str(value).strip() if value is not None else ""
+
+        sections: list[str] = []
+
+        cover_letter_cfg = self.tool.config.get("cover_letter") or {}
+        if isinstance(cover_letter_cfg, dict):
+            bio = clean(cover_letter_cfg.get("bio"))
+            if bio:
+                sections.append("### Био\n\n" + bio)
+
+        contacts_cfg = self.tool.config.get("contacts") or {}
+        if isinstance(contacts_cfg, dict):
+            faq = contacts_cfg.get("faq") or []
+            if isinstance(faq, list):
+                faq_lines: list[str] = []
+                for entry in faq:
+                    if not isinstance(entry, dict):
+                        continue
+                    q = clean(entry.get("q") or entry.get("question"))
+                    a = clean(entry.get("a") or entry.get("answer"))
+                    if q and a:
+                        faq_lines.append(f"Q: {q}\nA: {a}")
+                if faq_lines:
+                    sections.append(
+                        "### Ответы на типовые вопросы\n\n"
+                        "Используй эти данные дословно, если вопрос подходит. "
+                        "НЕ пиши плейсхолдеры (ХХХ, YYY, [имя], [компания]).\n\n"
+                        + "\n\n".join(faq_lines)
+                    )
+
+        if not sections:
+            return base_prompt
+
+        logger.info(
+            "Контекст кандидата подмешан в system-prompt: блоков=%d.",
+            len(sections),
+        )
+        return (
+            base_prompt
+            + "\n\n## КОНТЕКСТ О КАНДИДАТЕ\n\n"
+            + "\n\n".join(sections)
+        )
+
+    def _cleanup_chat(
+        self,
+        *,
+        nid: str | int,
+        vacancy: dict,
+        reason: str,
+        send_decline: bool,
+    ) -> None:
+        """Отменяет отклик и удаляет чат в trash. Используется для отказов
+        и чёрного списка работодателей.
+
+        `send_decline=False` для случаев, когда отказ уже от работодателя —
+        нет смысла отправлять им «вежливый» decline-месседж в ответ.
+        Для самостоятельной отмены (наш blacklist) — `send_decline=True`.
+        """
+        url = vacancy.get("alternate_url") or "(no url)"
+        if self.dry_run:
+            logger.info(
+                "[dry-run] удалил бы чат %s (%s): %s", nid, reason, url
+            )
+            return
+
+        try:
+            self.api_client.delete(
+                f"/negotiations/active/{nid}",
+                with_decline_message=send_decline,
+            )
+        except Exception as ex:
+            logger.warning(
+                "Не удалось отменить отклик %s (%s): %s", nid, reason, ex
+            )
+            return
+
+        if self._delete_chat(nid):
+            print(f"🗑 Удалил чат {nid} ({reason}): {url}")
+        else:
+            print(
+                f"❌ Отменил отклик {nid} ({reason}), но чат удалить не получилось: {url}"
+            )
+
+    def _delete_chat(self, topic: str | int) -> bool:
+        """Чат можно удалить только через web-эндпоинт (API не умеет).
+
+        Дублирует логику из clear_negotiations.delete_chat — если будет
+        больше точек вызова, вынести в shared util.
+        """
+        headers = {
+            "X-Hhtmfrom": "main",
+            "X-Hhtmsource": "negotiation_list",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Xsrftoken": self.tool.xsrf_token,
+            "Referer": "https://hh.ru/applicant/negotiations?hhtmFrom=main&hhtmFromLabel=header",
+        }
+        payload = {
+            "topic": topic,
+            "query": "?hhtmFrom=main&hhtmFromLabel=header",
+            "substate": "HIDE",
+        }
+        try:
+            r = self.tool.session.post(
+                "https://hh.ru/applicant/negotiations/trash",
+                payload,
+                headers=headers,
+            )
+            r.raise_for_status()
+            return True
+        except requests.RequestException as ex:
+            logger.error("Не удалось удалить чат %s: %s", topic, ex)
+            return False
 
     def reply_employers(self):
         blacklist = set(self.tool.get_blacklisted())
@@ -172,22 +386,37 @@ class Operation(BaseOperation):
                     continue
 
                 state_id = negotiation["state"]["id"]
-                if state_id == "discard":
-                    continue
-
-                if self.only_invitations and not state_id.startswith("inv"):
-                    continue
-
                 nid = negotiation["id"]
                 vacancy = negotiation["vacancy"]
                 employer = vacancy.get("employer") or {}
                 salary = vacancy.get("salary") or {}
 
+                if state_id == "discard":
+                    if self.delete_discarded:
+                        self._cleanup_chat(
+                            nid=nid,
+                            vacancy=vacancy,
+                            reason="отказ работодателя",
+                            send_decline=False,
+                        )
+                    continue
+
+                if self.only_invitations and not state_id.startswith("inv"):
+                    continue
+
                 if employer.get("id") in blacklist:
-                    print(
-                        "🚫 Пропускаем заблокированного работодателя",
-                        employer.get("alternate_url"),
-                    )
+                    if self.delete_blacklisted:
+                        self._cleanup_chat(
+                            nid=nid,
+                            vacancy=vacancy,
+                            reason="чёрный список",
+                            send_decline=True,
+                        )
+                    else:
+                        print(
+                            "🚫 Пропускаем заблокированного работодателя",
+                            employer.get("alternate_url"),
+                        )
                     continue
 
                 placeholders = {
@@ -243,9 +472,10 @@ class Operation(BaseOperation):
                     last_message["author"]["participant_type"] == "employer"
                 )
 
-                if is_employer_message or not negotiation.get(
-                    "viewed_by_opponent"
-                ):
+                # Отвечаем только когда последнее сообщение в чате — от работодателя.
+                # Если своё сообщение ещё не просмотрено — не «допинываем», иначе
+                # AI начинает писать в пустоту лишние тексты.
+                if is_employer_message:
                     send_message = ""
                     if self.reply_message:
                         send_message = (
@@ -253,22 +483,15 @@ class Operation(BaseOperation):
                         )
                         logger.debug(f"Template message: {send_message}")
                     elif self.cover_letter_ai:
-                        try:
-                            ai_query = (
-                                f"Вакансия: {placeholders['vacancy_name']}\n"
-                                f"История переписки:\n"
-                                + "\n".join(message_history[-10:])
-                                + f"\n\nИнструкция: {self.message_prompt}"
-                            )
-                            send_message = self.cover_letter_ai.complete(
-                                ai_query
-                            )
-                            logger.debug(f"AI message: {send_message}")
-                        except AIError as ex:
-                            logger.warning(
-                                f"Ошибка OpenAI для чата {nid}: {ex}"
-                            )
-                            continue
+                        # AIError намеренно не глушим — пусть скрипт упадёт с кодом 1.
+                        ai_query = (
+                            f"Вакансия: {placeholders['vacancy_name']}\n"
+                            f"История переписки:\n"
+                            + "\n".join(message_history[-10:])
+                            + f"\n\nИнструкция: {self.message_prompt}"
+                        )
+                        send_message = self.cover_letter_ai.complete(ai_query)
+                        logger.debug(f"AI message: {send_message}")
                     else:
                         print("🏢", placeholders["employer_name"])
                         print("💼", placeholders["vacancy_name"])

@@ -10,6 +10,7 @@ import re
 import time
 from datetime import datetime
 from email.message import EmailMessage
+from http.cookiejar import Cookie
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Literal
@@ -18,7 +19,6 @@ from urllib.parse import urlparse
 import requests
 
 from .. import utils
-from ..ai.base import AIError
 from ..api import BadResponse, Redirect, datatypes
 from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
@@ -134,13 +134,41 @@ class Operation(BaseOperation):
             "--system-prompt",
             "--ai-system",
             help="Системный промпт для AI генерации сопроводительных писем",
-            default="Напиши сопроводительное письмо для отклика на эту вакансию. Не используй placeholder'ы, твой ответ будет отправлен без обработки.",  # noqa: E501
+            default=(
+                "Ты пишешь короткое сопроводительное письмо от соискателя в ответ на конкретную вакансию. "
+                "Текст уйдёт работодателю как есть, без редактуры.\n\n"
+                "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО (нарушение испортит результат):\n"
+                "— Эмодзи и любые символы-смайлы: 🤔 😎 🚀 ✅ 👋 ⚡ и подобные. Ни одного. Никогда.\n"
+                "— Восклицательные знаки. Только точки и запятые в конце предложений.\n"
+                "— Приветствия «Привет», «Здравствуйте», «Хай», «Добрый день», «Уважаемый HR».\n"
+                "— Самопрезентации именем: «Меня зовут X», «X здесь», «Привет, я X», «Здравствуйте, X на связи». Имя из контекста — это справочные данные для тебя, не для текста письма. Подписи в конце письма тоже не нужно.\n"
+                "— Любые упоминания себя в третьем лице («Байназар разрабатывает», «у Байназара есть опыт» и т.п.). Пиши ТОЛЬКО от первого лица: «я разрабатывал», «у меня есть опыт».\n"
+                "— Подписи «С уважением», «С наилучшими пожеланиями», «Жду приглашения», «Жду обратной связи».\n"
+                "— Молодёжно-расслабленные обороты: «прям зацепило», «не смог удержаться», «крутая вакансия», «классный стек».\n"
+                "— Канцелярит: «выражаю заинтересованность», «имею честь», «позвольте представиться», «являюсь», «обладаю», «осуществляю».\n"
+                "— AI-штампы: «ключевой», «значительный опыт», «глубокие знания», «высокий уровень», «активный участник», «динамично развивающаяся», «реальную пользу», «новые вызовы».\n"
+                "— Реверансы: «с удовольствием», «благодарю за внимание», «буду рад возможности обсудить», «надеюсь на сотрудничество».\n"
+                "— Деепричастные обороты на старте предложений («являясь...», «обладая...», «имея...»).\n"
+                "— Тройные перечисления для красоты («надёжность, эффективность и качество»).\n"
+                "— Длинное тире. Только обычные точки, запятые, двоеточия.\n"
+                "— Квадратные скобки и плейсхолдеры вида [имя]/[компания]. Если данных нет — пропусти кусок.\n"
+                "— Общие самохвалебные фразы без привязки к вакансии: «готов приносить пользу», «достаточно знаний и опыта», «готов влиться в команду».\n\n"
+                "КАК ПИСАТЬ:\n"
+                "— Длина: 2-4 коротких предложения. Если можно сказать меньше — скажи меньше.\n"
+                "— Тон: спокойный, уверенный, профессиональный взрослый разработчик. Не «парень в чате», не пафосный, не угодливый.\n"
+                "— Пиши от первого лица.\n"
+                "— Опирайся на КОНКРЕТНЫЕ технологии и требования из описания вакансии — называй их по имени.\n"
+                "— Покажи прямую связь моего опыта с их стеком/задачами (упомяни проект, технологию, длительность опыта).\n"
+                "— Никаких общих фраз без привязки к конкретике вакансии или резюме.\n"
+                "— Без оценочных слов «крутой», «отличный», «успешный», «лучший».\n"
+                "— Начинай сразу с фактов — о себе или о вакансии. Без приветствия."
+            ),
         )
         parser.add_argument(
             "--message-prompt",
             "--prompt",
             help="Промпт для генерации сопроводительного письма",
-            default="Сгенерируй сопроводительное письмо не более 5-7 предложений от моего имени для вакансии",  # noqa: E501
+            default="Напиши сопроводительное письмо по данным ниже.",  # noqa: E501
         )
         parser.add_argument(
             "--total-pages",
@@ -351,8 +379,11 @@ class Operation(BaseOperation):
         self.sort_point_lng = args.sort_point_lng
         self.top_lat = args.top_lat
         self.total_pages = args.total_pages
+        effective_system_prompt = self._build_effective_system_prompt(
+            args.system_prompt
+        )
         self.cover_letter_ai = (
-            tool.get_cover_letter_ai(args.system_prompt)
+            tool.get_cover_letter_ai(effective_system_prompt)
             if args.use_ai
             else None
         )
@@ -360,7 +391,84 @@ class Operation(BaseOperation):
         self.vacancy_filter_ai = None
         self._resume_analysis_cache: dict[tuple[str | None, str], str] = {}
 
+        self.extras_text = self._build_extras_block()
+        if self.extras_text:
+            faq_count = len(
+                [
+                    e
+                    for e in (
+                        (self.tool.config.get("contacts") or {}).get("faq")
+                        or []
+                    )
+                    if isinstance(e, dict)
+                ]
+            )
+            logger.info(
+                "К письму добавляется блок FAQ/контактов (FAQ: %d пунктов).",
+                faq_count,
+            )
+
         self._apply_vacancies()
+
+    def _build_effective_system_prompt(self, base_prompt: str) -> str:
+        """Дополняет system-prompt блоками `КОНТЕКСТ О КАНДИДАТЕ` и
+        `ОТВЕТЫ НА ТИПОВЫЕ ВОПРОСЫ` из конфига.
+
+        Контекст нужен модели и для писем, и для ответов на тестовые
+        вопросы вакансий (зарплата, локация, готовность к выходу).
+        Без него GigaChat галлюцинирует имена и пишет плейсхолдеры
+        вроде «ХХХ» в полях, где нет данных.
+
+        Side effect: ставит `self._has_bio = True`, если контекст
+        был добавлен — это сигнал для `_build_cover_letter_prompt`
+        не дублировать данные в per-vacancy промпте.
+        """
+        sections: list[str] = []
+
+        cover_letter_cfg = self.tool.config.get("cover_letter") or {}
+        if isinstance(cover_letter_cfg, dict):
+            bio = self._as_clean_str(cover_letter_cfg.get("bio"))
+            if bio:
+                sections.append("### Био\n\n" + bio)
+
+        contacts_cfg = self.tool.config.get("contacts") or {}
+        if isinstance(contacts_cfg, dict):
+            faq = contacts_cfg.get("faq") or []
+            if isinstance(faq, list):
+                faq_lines: list[str] = []
+                for entry in faq:
+                    if not isinstance(entry, dict):
+                        continue
+                    q = self._as_clean_str(
+                        entry.get("q") or entry.get("question")
+                    )
+                    a = self._as_clean_str(
+                        entry.get("a") or entry.get("answer")
+                    )
+                    if q and a:
+                        faq_lines.append(f"Q: {q}\nA: {a}")
+                if faq_lines:
+                    sections.append(
+                        "### Ответы на типовые вопросы\n\n"
+                        "Используй эти данные дословно, если вопрос подходит. "
+                        "НЕ пиши плейсхолдеры (ХХХ, YYY, [имя], [компания]).\n\n"
+                        + "\n\n".join(faq_lines)
+                    )
+
+        self._has_bio = bool(sections)
+
+        if not sections:
+            return base_prompt
+
+        logger.info(
+            "Контекст кандидата подмешан в system-prompt: блоков=%d.",
+            len(sections),
+        )
+        return (
+            base_prompt
+            + "\n\n## КОНТЕКСТ О КАНДИДАТЕ\n\n"
+            + "\n\n".join(sections)
+        )
 
     def _get_full_resume(self, resume_id: str) -> dict:
         return self.api_client.get(f"/resumes/{resume_id}")
@@ -439,6 +547,215 @@ class Operation(BaseOperation):
         self._resume_analysis_cache[cache_key] = result
         return result
 
+    @staticmethod
+    def _strip_hh_snippet_html(s: str) -> str:
+        return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+    # Максимальная длина описания вакансии в промпте (символы).
+    # Удерживает токены в разумных рамках при многотысячных описаниях.
+    COVER_LETTER_DESCRIPTION_LIMIT = 3000
+
+    def _fetch_full_vacancy(self, vacancy_id: str | int) -> dict | None:
+        try:
+            return self.api_client.get(f"/vacancies/{vacancy_id}")
+        except CaptchaRequired as ex:
+            logger.warning(
+                "HH вернул капчу для /vacancies/%s — пробую решить через AI",
+                vacancy_id,
+            )
+            try:
+                solved = asyncio.run(
+                    self._solve_captcha_async(ex.captcha_url)
+                )
+            except Exception as solve_ex:
+                logger.error(
+                    "Ошибка при решении капчи для /vacancies/%s: %s",
+                    vacancy_id,
+                    solve_ex,
+                )
+                raise
+            if not solved:
+                logger.warning(
+                    "Не удалось решить капчу для /vacancies/%s — скип",
+                    vacancy_id,
+                )
+                raise
+            # После успешного решения куки уже скопированы в self.tool.session,
+            # повторяем запрос один раз.
+            try:
+                return self.api_client.get(f"/vacancies/{vacancy_id}")
+            except CaptchaRequired:
+                logger.warning(
+                    "Капча для /vacancies/%s повторно — скип вакансии",
+                    vacancy_id,
+                )
+                raise
+        except Exception as ex:
+            logger.warning(
+                "Не удалось получить полную вакансию %s: %s", vacancy_id, ex
+            )
+            return None
+
+    def _build_cover_letter_prompt(
+        self,
+        *,
+        vacancy: dict,
+        resume: dict,
+        message_placeholders: dict,
+        placeholders: dict,
+    ) -> str:
+        full_vacancy = (
+            self._fetch_full_vacancy(vacancy["id"])
+            if vacancy.get("id")
+            else None
+        )
+
+        description = ""
+        key_skills = ""
+        if full_vacancy:
+            raw_description = full_vacancy.get("description") or ""
+            if raw_description:
+                description = strip_tags(raw_description)
+                if len(description) > self.COVER_LETTER_DESCRIPTION_LIMIT:
+                    description = (
+                        description[: self.COVER_LETTER_DESCRIPTION_LIMIT].rstrip()
+                        + "…"
+                    )
+            key_skills = ", ".join(
+                s["name"]
+                for s in (full_vacancy.get("key_skills") or [])
+                if s.get("name")
+            )
+
+        if not description:
+            snippet = vacancy.get("snippet") or {}
+            responsibility = self._strip_hh_snippet_html(
+                snippet.get("responsibility") or ""
+            )
+            requirement = self._strip_hh_snippet_html(
+                snippet.get("requirement") or ""
+            )
+            description_parts = []
+            if responsibility:
+                description_parts.append(f"Обязанности: {responsibility}")
+            if requirement:
+                description_parts.append(f"Требования: {requirement}")
+            description = "\n".join(description_parts)
+
+        # Если bio из конфига уже улетел в system-prompt, не дублируем опыт здесь.
+        resume_summary = (
+            "" if self._has_bio else self._analyze_resume_light(resume).strip()
+        )
+
+        parts = [self.message_prompt, ""]
+        first_name = (placeholders.get("first_name") or "").strip()
+        if first_name and not self._has_bio:
+            parts.append(f"Меня зовут: {first_name}")
+        parts.append(
+            f"Вакансия: {message_placeholders.get('vacancy_name', '')}"
+        )
+        employer_name = (
+            message_placeholders.get("employer_name") or ""
+        ).strip()
+        if employer_name:
+            parts.append(f"Работодатель: {employer_name}")
+        if key_skills:
+            parts.append(f"Ключевые навыки из вакансии: {key_skills}")
+        if description:
+            parts.append("")
+            parts.append("Описание вакансии:")
+            parts.append(description)
+        if resume_summary:
+            parts.append("")
+            parts.append("Мой опыт:")
+            parts.append(resume_summary)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _as_clean_str(value) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @staticmethod
+    def _normalize_telegram(value) -> str:
+        value = Operation._as_clean_str(value)
+        if not value:
+            return ""
+        if value.startswith(("http://", "https://", "@")):
+            return value
+        return "@" + value
+
+    def _build_contacts_block(self) -> str:
+        contacts = self.tool.config.get("contacts") or {}
+        if not isinstance(contacts, dict):
+            return ""
+
+        email = self._as_clean_str(contacts.get("email"))
+        telegram = self._normalize_telegram(contacts.get("telegram"))
+        phone = self._as_clean_str(contacts.get("phone"))
+        max_url = self._as_clean_str(contacts.get("max"))
+
+        lines: list[str] = []
+        if email:
+            lines.append(f"Email: {email}")
+        if telegram:
+            lines.append(f"Telegram: {telegram}")
+        if phone:
+            lines.append(f"Телефон: {phone}")
+        if max_url:
+            lines.append(f"Max: {max_url}")
+
+        if not lines:
+            return ""
+
+        return "Контакты для связи:\n" + "\n".join(lines)
+
+    def _build_faq_block(self) -> str:
+        contacts = self.tool.config.get("contacts") or {}
+        if not isinstance(contacts, dict):
+            return ""
+
+        faq = contacts.get("faq")
+        if not isinstance(faq, list) or not faq:
+            return ""
+
+        items: list[str] = []
+        for entry in faq:
+            if not isinstance(entry, dict):
+                continue
+            q = self._as_clean_str(entry.get("q") or entry.get("question"))
+            a = self._as_clean_str(entry.get("a") or entry.get("answer"))
+            if not q or not a:
+                continue
+            items.append(f"— {q}\n— {a}")
+
+        if not items:
+            return ""
+
+        return "Часто задаваемые вопросы:\n\n" + "\n\n".join(items)
+
+    def _build_extras_block(self) -> str:
+        contacts = self.tool.config.get("contacts") or {}
+        if not isinstance(contacts, dict):
+            contacts = {}
+
+        sections: list[str] = []
+
+        faq_block = self._build_faq_block()
+        if faq_block:
+            sections.append(faq_block)
+
+        contacts_block = self._build_contacts_block()
+        if contacts_block:
+            sections.append(contacts_block)
+
+        closing = self._as_clean_str(contacts.get("closing"))
+        if closing:
+            sections.append(closing)
+
+        return "\n\n".join(sections)
+
     def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
         try:
             full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
@@ -485,41 +802,35 @@ class Operation(BaseOperation):
         if not self.vacancy_filter_ai:
             return True
 
+        # AIError здесь намеренно не ловим — пусть провайдер AI развалит скрипт.
         for attempt in range(MAX_RETRIES):
-            try:
-                response = self.vacancy_filter_ai.complete(prompt).strip()
+            response = self.vacancy_filter_ai.complete(prompt).strip()
 
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "AI %s ответ (попытка %d): %s",
-                        log_suffix,
-                        attempt + 1,
-                        response,
-                    )
-
-                result = self._parse_ai_json_response(response)
-                if result is not None:
-                    if result:
-                        return True
-                    logger.info(
-                        "Вакансия %s отклонена AI %s", vacancy_name, log_suffix
-                    )
-                    return False
-
-                # Если не удалось распарсить JSON, повторяем запрос
-                logger.warning(
-                    "AI %s не дал валидный JSON для вакансии %s (попытка %d/%d)",
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "AI %s ответ (попытка %d): %s",
                     log_suffix,
-                    vacancy_name,
                     attempt + 1,
-                    MAX_RETRIES,
+                    response,
                 )
-                continue
 
-            except AIError as e:
-                # ChatOpenAI уже делает retry для 429, поэтому здесь только логируем
-                logger.error("Ошибка AI %s: %s", log_suffix, e)
-                return True
+            result = self._parse_ai_json_response(response)
+            if result is not None:
+                if result:
+                    return True
+                logger.info(
+                    "Вакансия %s отклонена AI %s", vacancy_name, log_suffix
+                )
+                return False
+
+            # Если не удалось распарсить JSON, повторяем запрос
+            logger.warning(
+                "AI %s не дал валидный JSON для вакансии %s (попытка %d/%d)",
+                log_suffix,
+                vacancy_name,
+                attempt + 1,
+                MAX_RETRIES,
+            )
 
         logger.warning(
             "AI %s не дал валидный JSON после %d попыток для вакансии %s",
@@ -673,13 +984,35 @@ class Operation(BaseOperation):
 
                 await page.wait_for_load_state("networkidle", timeout=15000)
 
+                # Переносим куки из Playwright в HH-сессию. Нельзя
+                # использовать requests'овский .set(name, value) — у нас
+                # HHOnlyCookieJar (наследник http.cookiejar.MozillaCookieJar),
+                # API которого требует Cookie-объект через set_cookie().
                 cookies = await context.cookies()
                 for c in cookies:
-                    self.tool.session.cookies.set(
-                        c["name"],
-                        c["value"],
-                        domain=c.get("domain", ""),
-                        path=c.get("path", "/"),
+                    domain = c.get("domain", "") or ""
+                    self.tool.session.cookies.set_cookie(
+                        Cookie(
+                            version=0,
+                            name=c["name"],
+                            value=c["value"],
+                            port=None,
+                            port_specified=False,
+                            domain=domain,
+                            domain_specified=bool(domain),
+                            domain_initial_dot=domain.startswith("."),
+                            path=c.get("path", "/"),
+                            path_specified=True,
+                            secure=bool(c.get("secure", False)),
+                            expires=int(c.get("expires") or 0) or None,
+                            discard=False,
+                            comment=None,
+                            comment_url=None,
+                            rest={
+                                "HttpOnly": str(c.get("httpOnly", False))
+                            },
+                            rfc2109=False,
+                        )
                     )
 
                 return True
@@ -975,14 +1308,11 @@ class Operation(BaseOperation):
                     "response_letter_required"
                 ):
                     if self.cover_letter_ai:
-                        msg = self.message_prompt + "\n\n"
-                        msg += (
-                            "Название вакансии: "
-                            + message_placeholders["vacancy_name"]
-                        )
-                        msg += (
-                            "Мое резюме: "
-                            + message_placeholders["resume_title"]
+                        msg = self._build_cover_letter_prompt(
+                            vacancy=vacancy,
+                            resume=resume,
+                            message_placeholders=message_placeholders,
+                            placeholders=placeholders,
                         )
                         logger.debug("prompt: %s", msg)
                         letter = self.cover_letter_ai.complete(msg)
@@ -992,6 +1322,14 @@ class Operation(BaseOperation):
                         )
 
                     logger.debug(letter)
+
+                if self.extras_text:
+                    letter = (
+                        letter + "\n\n" + self.extras_text
+                        if letter
+                        else self.extras_text
+                    )
+                    logger.debug("letter with extras: %s", letter)
 
                 logger.debug(
                     "Пробуем откликнуться на вакансию: %s",
@@ -1128,8 +1466,10 @@ class Operation(BaseOperation):
                 break
             except ApiError as ex:
                 logger.warning(ex)
-            except (BadResponse, AIError) as ex:
+            except BadResponse as ex:
                 logger.error(ex)
+            # AIError намеренно не ловим — провайдер AI должен быть стабильным,
+            # любая его ошибка валит скрипт (через main.py top-level handler).
 
         logger.info(
             "Закончили рассылку откликов для резюме: %s (%s). Отправлено: %d",
@@ -1258,7 +1598,16 @@ class Operation(BaseOperation):
                         "{{Простите|Извините}, но я не перехожу по {внешним|сторонним} ссылкам, так как {опасаюсь взлома|не хочу {быть взломанным|подхватить вирус|чтобы у меня {со|с банковского} счета украли деньги}}.|У меня нет времени на заполнение анкет и гуглодоков}"
                     )
                 elif self.cover_letter_ai:
-                    prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
+                    prompt = (
+                        "Ответь на вопрос работодателя коротко и по делу, "
+                        "от первого лица. Используй ТОЧНЫЕ данные из контекста "
+                        "о кандидате (био и блок ответов на типовые вопросы) — "
+                        "не выдумывай и НЕ пиши плейсхолдеры вроде "
+                        "ХХХ, YYY, [сумма], [имя], [компания]. "
+                        "Если конкретного ответа в контексте нет — дай нейтральный "
+                        "короткий ответ без выдумок.\n\n"
+                        f"Вопрос: {question}"
+                    )
                     answer = self.cover_letter_ai.complete(prompt)
                 # Тупоеблые любят вопросы с ответами да/нет, где ответ да является правильным в большинстве случаев.
                 else:
