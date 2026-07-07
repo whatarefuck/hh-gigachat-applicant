@@ -393,11 +393,37 @@ class HHApplicantTool(MegaTool):
             return self._build_gigachat_client(
                 c, system_prompt=system_prompt, config_section=config_section
             )
+        if provider in ("anthropic", "claude"):
+            return self._build_anthropic_client(
+                c, system_prompt=system_prompt, config_section=config_section
+            )
 
         raise ValueError(
             f"Неизвестный AI-провайдер: {provider!r}. "
-            "Поддерживаются: openai, gigachat"
+            "Поддерживаются: openai, gigachat, anthropic"
         )
+
+    def _build_anthropic_client(
+        self, c: dict, *, system_prompt: str, config_section: str
+    ) -> ai.ChatAnthropic:
+        api_key = c.get("api_key")
+        if not api_key:
+            raise ValueError(
+                f"API-ключ Anthropic не задан. Укажите 'api_key' (sk-ant-...) "
+                f"в секции '{config_section}'."
+            )
+        kwargs: dict = {
+            "api_key": api_key,
+            "model": c.get("model", "claude-sonnet-4-5"),
+            "temperature": c.get("temperature", 0.0),
+            "max_completion_tokens": c.get("max_completion_tokens", 1000),
+            "system_prompt": system_prompt,
+            "rate_limit": c.get("rate_limit", 40),
+            "session": self.openai_session,
+        }
+        if c.get("base_url"):
+            kwargs["base_url"] = c["base_url"]
+        return ai.ChatAnthropic(**kwargs)
 
     def _build_openai_client(
         self, c: dict, *, system_prompt: str, config_section: str

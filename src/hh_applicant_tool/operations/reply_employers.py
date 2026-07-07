@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import random
+import signal
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import requests
@@ -30,6 +34,8 @@ except ImportError:
 
 logger = logging.getLogger(__package__)
 
+_PID_FILENAME = "reply-employers.pid"
+
 
 class Namespace(BaseNamespace):
     reply_message: str
@@ -44,6 +50,8 @@ class Namespace(BaseNamespace):
     delete_blacklisted: bool
     watch: bool
     interval: int
+    daemon: bool
+    stop: bool
 
 
 class Operation(BaseOperation):
@@ -157,10 +165,134 @@ class Operation(BaseOperation):
             "--interval",
             type=int,
             default=300,
-            help="Пауза между прогонами в секундах для --watch (по умолчанию 300).",
+            help="Пауза между прогонами в секундах для --watch / --daemon (по умолчанию 300).",
+        )
+        parser.add_argument(
+            "--daemon",
+            "-D",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Запустить в фоновом режиме: отключиться от терминала и опрашивать чаты "
+            "постоянно. Логи пишутся в файл. Остановить: --stop.",
+        )
+        parser.add_argument(
+            "--stop",
+            action="store_true",
+            default=False,
+            help="Остановить фоновый демон reply-employers (отправляет SIGTERM).",
         )
 
-    def run(self, tool: HHApplicantTool, args: Namespace) -> None:
+    # ------------------------------------------------------------------
+    # Daemon helpers
+    # ------------------------------------------------------------------
+
+    def _pid_file(self, tool: "HHApplicantTool") -> Path:
+        return tool.config_path / _PID_FILENAME
+
+    def _stop_daemon(self, tool: "HHApplicantTool") -> None:
+        pid_file = self._pid_file(tool)
+        if not pid_file.exists():
+            print("Демон не запущен (PID файл не найден).")
+            return
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+            print(f"SIGTERM отправлен процессу {pid}.")
+            pid_file.unlink(missing_ok=True)
+        except ProcessLookupError:
+            print("Процесс уже завершён.")
+            pid_file.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.error("Не удалось остановить демон: %s", exc)
+
+    def _daemonize(self, tool: "HHApplicantTool") -> None:
+        """Unix double-fork: отключает процесс от терминала.
+
+        Родитель печатает подсказку и завершается; дочерний процесс
+        (демон) возвращается и продолжает работу в фоне.
+        """
+        pid_file = self._pid_file(tool)
+
+        if pid_file.exists():
+            try:
+                existing_pid = int(pid_file.read_text().strip())
+                os.kill(existing_pid, 0)
+                print(f"Демон уже запущен (PID {existing_pid}).")
+                print("Остановить: hh-applicant-tool reply-employers --stop")
+                sys.exit(1)
+            except ProcessLookupError:
+                pid_file.unlink(missing_ok=True)
+
+        log_path = tool.log_file
+
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            sys.exit(f"fork #1 завершился с ошибкой: {exc}")
+
+        if pid > 0:
+            # Родитель: печатаем инструкцию и выходим.
+            print("Демон reply-employers запущен в фоне.")
+            print(f"Логи: {log_path}")
+            print("Остановить: hh-applicant-tool reply-employers --stop")
+            sys.stdout.flush()
+            sys.exit(0)
+
+        os.setsid()
+
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            sys.exit(f"fork #2 завершился с ошибкой: {exc}")
+
+        if pid > 0:
+            sys.exit(0)
+
+        # Мы — демон (внук оригинального процесса).
+        os.chdir("/")
+        pid_file.write_text(str(os.getpid()))
+
+        # Перенаправляем стандартные потоки в лог-файл.
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        log_str = str(log_path)
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        log_fd = os.open(log_str, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(devnull_fd, 0)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+        os.close(devnull_fd)
+        os.close(log_fd)
+
+        # Переоткрываем Python-объекты потоков, чтобы print() тоже шёл в лог.
+        sys.stdin = open(os.devnull, "r")
+        sys.stdout = open(log_str, "a", buffering=1)
+        sys.stderr = open(log_str, "a", buffering=1)
+
+        def _on_term(signum: int, frame: object) -> None:
+            logger.info("Демон получил сигнал %d, завершаю работу.", signum)
+            pid_file.unlink(missing_ok=True)
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _on_term)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def run(self, tool: "HHApplicantTool", args: Namespace) -> None:
+        if args.stop:
+            self._stop_daemon(tool)
+            return
+
+        # Демонизация должна происходить ДО инициализации API-клиента,
+        # чтобы форк не захватил открытые TCP-соединения.
+        if args.daemon:
+            self._daemonize(tool)
+            # Только дочерний процесс (демон) продолжает выполнение.
+
         self.tool = tool
         self.api_client = tool.api_client
         self.resume_id = tool.first_resume_id()
@@ -188,37 +320,45 @@ class Operation(BaseOperation):
 
         logger.debug(f"{self.reply_message = }")
 
-        if not args.watch:
+        loop_mode = args.watch or args.daemon
+
+        if not loop_mode:
             self.reply_employers()
             return
 
         interval = max(30, args.interval)
-        logger.info(
-            "Live-режим reply-employers: интервал ~%dс. Ctrl+C для остановки.",
-            interval,
-        )
-        print(
-            f"👀 Live-режим: проверяю чаты каждые ~{interval}с. "
-            "Останови через Ctrl+C."
-        )
+
+        if args.daemon:
+            logger.info(
+                "Демон reply-employers запущен (PID %d). Интервал ~%dс.",
+                os.getpid(),
+                interval,
+            )
+        else:
+            logger.info(
+                "Live-режим reply-employers: интервал ~%dс. Ctrl+C для остановки.",
+                interval,
+            )
+            print(
+                f"Live-режим: проверяю чаты каждые ~{interval}с. "
+                "Останови через Ctrl+C."
+            )
+
         while True:
             try:
                 self.reply_employers()
             except (ApiError, requests.exceptions.RequestException) as ex:
-                # API-сбои и обрывы сети (если ретраи сессии исчерпаны при
-                # долгом отключении wifi) не должны ронять watch-цикл.
                 logger.error("Ошибка прогона reply-employers: %s", ex)
-            # Случайный джиттер ±20%, чтобы не выглядеть роботом.
             sleep_for = interval * random.uniform(0.8, 1.2)
-            logger.debug("Сплю %.0fс до следующего прогона", sleep_for)
+            logger.debug("Сплю %.0fс до следующего прогона.", sleep_for)
             time.sleep(sleep_for)
 
-    def _build_effective_system_prompt(self, base_prompt: str) -> str:
-        """Подмешивает в system-prompt био и FAQ-ответы из конфига.
+    # ------------------------------------------------------------------
+    # Business logic (unchanged)
+    # ------------------------------------------------------------------
 
-        Дублирует логику из apply_vacancies — даёт модели тот же контекст
-        при ответах в чате (имя, опыт, вилка, готовность к выходу и т.п.).
-        """
+    def _build_effective_system_prompt(self, base_prompt: str) -> str:
+        """Подмешивает в system-prompt био и FAQ-ответы из конфига."""
 
         def clean(value: object) -> str:
             return str(value).strip() if value is not None else ""
@@ -272,13 +412,6 @@ class Operation(BaseOperation):
         reason: str,
         send_decline: bool,
     ) -> None:
-        """Отменяет отклик и удаляет чат в trash. Используется для отказов
-        и чёрного списка работодателей.
-
-        `send_decline=False` для случаев, когда отказ уже от работодателя —
-        нет смысла отправлять им «вежливый» decline-месседж в ответ.
-        Для самостоятельной отмены (наш blacklist) — `send_decline=True`.
-        """
         url = vacancy.get("alternate_url") or "(no url)"
         if self.dry_run:
             logger.info(
@@ -298,18 +431,14 @@ class Operation(BaseOperation):
             return
 
         if self._delete_chat(nid):
-            print(f"🗑 Удалил чат {nid} ({reason}): {url}")
+            print(f"Удалил чат {nid} ({reason}): {url}")
         else:
             print(
-                f"❌ Отменил отклик {nid} ({reason}), но чат удалить не получилось: {url}"
+                f"Отменил отклик {nid} ({reason}), но чат удалить не получилось: {url}"
             )
 
     def _delete_chat(self, topic: str | int) -> bool:
-        """Чат можно удалить только через web-эндпоинт (API не умеет).
-
-        Дублирует логику из clear_negotiations.delete_chat — если будет
-        больше точек вызова, вынести в shared util.
-        """
+        """Чат можно удалить только через web-эндпоинт (API не умеет)."""
         headers = {
             "X-Hhtmfrom": "main",
             "X-Hhtmsource": "negotiation_list",
@@ -367,17 +496,11 @@ class Operation(BaseOperation):
 
         for negotiation in self.tool.get_negotiations():
             try:
-                # try:
-                #     self.tool.storage.negotiations.save(negotiation)
-                # except RepositoryError as e:
-                #     logger.exception(e)
-
                 if not (resume := resume_map.get(negotiation["resume"]["id"])):
                     continue
 
                 updated_at = parse_api_datetime(negotiation["updated_at"])
 
-                # Пропуск откликов, которые не обновлялись более N дней (при просмотре они обновляются вроде)
                 if (
                     self.period
                     and (datetime.now(updated_at.tzinfo) - updated_at).days
@@ -414,7 +537,7 @@ class Operation(BaseOperation):
                         )
                     else:
                         print(
-                            "🚫 Пропускаем заблокированного работодателя",
+                            "Пропускаем заблокированного работодателя",
                             employer.get("alternate_url"),
                         )
                     continue
@@ -472,9 +595,6 @@ class Operation(BaseOperation):
                     last_message["author"]["participant_type"] == "employer"
                 )
 
-                # Отвечаем только когда последнее сообщение в чате — от работодателя.
-                # Если своё сообщение ещё не просмотрено — не «допинываем», иначе
-                # AI начинает писать в пустоту лишние тексты.
                 if is_employer_message:
                     send_message = ""
                     if self.reply_message:
@@ -483,7 +603,6 @@ class Operation(BaseOperation):
                         )
                         logger.debug(f"Template message: {send_message}")
                     elif self.cover_letter_ai:
-                        # AIError намеренно не глушим — пусть скрипт упадёт с кодом 1.
                         ai_query = (
                             f"Вакансия: {placeholders['vacancy_name']}\n"
                             f"История переписки:\n"
@@ -493,11 +612,11 @@ class Operation(BaseOperation):
                         send_message = self.cover_letter_ai.complete(ai_query)
                         logger.debug(f"AI message: {send_message}")
                     else:
-                        print("🏢", placeholders["employer_name"])
-                        print("💼", placeholders["vacancy_name"])
+                        print("Работодатель:", placeholders["employer_name"])
+                        print("Вакансия:", placeholders["vacancy_name"])
                         if salary:
                             print(
-                                "💵 от",
+                                "Зарплата: от",
                                 salary.get("from") or salary.get("to") or 0,
                                 "до",
                                 salary.get("to") or salary.get("from") or 0,
@@ -524,7 +643,7 @@ class Operation(BaseOperation):
                             continue
 
                         if not send_message:
-                            print("🚶 Пропускаем чат")
+                            print("Пропускаем чат")
                             continue
 
                         if send_message.startswith("/ban"):
@@ -533,7 +652,7 @@ class Operation(BaseOperation):
                             )
                             blacklist.add(employer["id"])
                             print(
-                                "🚫 Работодатель заблокирован",
+                                "Работодатель заблокирован",
                                 employer.get("alternate_url"),
                             )
                             continue
@@ -543,10 +662,9 @@ class Operation(BaseOperation):
                                 f"/negotiations/active/{nid}",
                                 with_decline_message=decline_msg.strip(),
                             )
-                            print("❌ Отмена заявки", vacancy["alternate_url"])
+                            print("Отмена заявки", vacancy["alternate_url"])
                             continue
 
-                    # Финальная отправка текста
                     if self.dry_run:
                         logger.debug(
                             "dry-run: отклик на %s: %s",
@@ -560,9 +678,9 @@ class Operation(BaseOperation):
                         message=send_message,
                         delay=random.uniform(1, 3),
                     )
-                    print(f"📨 Отправлено для {vacancy['alternate_url']}")
+                    print(f"Отправлено для {vacancy['alternate_url']}")
 
             except ApiError as ex:
                 logger.error(ex)
 
-        print("📝 Сообщения разосланы!")
+        print("Сообщения разосланы!")

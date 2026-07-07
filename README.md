@@ -1,17 +1,34 @@
+<div align="center">
+
 # HH Applicant Tool
 
-CLI-утилита для автоматизации работы на [hh.ru](https://hh.ru):
+**Автоматизация поиска работы на [hh.ru](https://hh.ru) и [Хабр Карьере](https://career.habr.com) с AI**
 
-- Массовая рассылка откликов с AI-сгенерированными сопроводительными письмами.
-- Автоматические ответы работодателям в чате.
-- AI-фильтрация вакансий перед откликом.
-- Автоматическое решение капчи через Vision-модели.
-- Поддержка нескольких профилей (аккаунтов) и резюме.
-- Поддерживаемые LLM: **GigaChat** (Sber) и любой OpenAI-совместимый API (OpenAI, OpenRouter, Ollama и др.).
+Массовые отклики с AI-письмами · авто-ответы в чатах · фильтрация вакансий · решение капчи
 
-[![Publish to PyPI](https://github.com/s3rgeym/hh-applicant-tool/actions/workflows/publish.yml/badge.svg)](https://github.com/s3rgeym/hh-applicant-tool/actions)
-[![PyPi Version](https://img.shields.io/pypi/v/hh-applicant-tool)](https://pypi.org/project/hh-applicant-tool/)
-[![Python Versions](https://img.shields.io/pypi/pyversions/hh-applicant-tool.svg)](https://pypi.org/project/hh-applicant-tool/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Stars](https://img.shields.io/github/stars/whatarefuck/hh-gigachat-applicant?style=flat-square)](https://github.com/whatarefuck/hh-gigachat-applicant/stargazers)
+[![Last commit](https://img.shields.io/github/last-commit/whatarefuck/hh-gigachat-applicant?style=flat-square)](https://github.com/whatarefuck/hh-gigachat-applicant/commits)
+[![License](https://img.shields.io/badge/license-Non--Commercial-orange?style=flat-square)](#лицензия)
+
+</div>
+
+---
+
+## Возможности
+
+| | |
+|---|---|
+| **AI-письма** | Сопроводительные письма под каждую вакансию: контекст из резюме, реальные метрики, без штампов |
+| **AI-фильтр вакансий** | Модель отсеивает неподходящие ещё до отклика — экономит дневной лимит |
+| **Решение тестов hh.ru** | AI отвечает на тестовые вопросы работодателя (вилка, локация, да/нет) |
+| **Ответы в чатах** | Авто-ответы работодателям, чистка отказов и заблокированных |
+| **Решение капчи** | Распознавание через Vision-модели (Claude / GigaChat Pro-Max) |
+| **Хабр Карьера** | Фоновый демон: ищет подходящие вакансии и откликается (Playwright) |
+| **Мульти-аккаунт** | Профили hh.ru + пул GigaChat-аккаунтов с авто-failover |
+| **Уведомления** | Sentry (ошибки) + Telegram (сообщения ассистента) |
+
+**Поддерживаемые LLM:** **Anthropic Claude** · **GigaChat** (Sber) · любой **OpenAI-совместимый** API (OpenAI, OpenRouter, Ollama).
 
 ---
 
@@ -21,6 +38,7 @@ CLI-утилита для автоматизации работы на [hh.ru](h
 - [Установка](#установка)
 - [Первый запуск](#первый-запуск)
 - [AI-провайдеры](#ai-провайдеры)
+  - [Anthropic Claude](#anthropic-claude)
   - [GigaChat: один аккаунт](#gigachat-один-аккаунт)
   - [GigaChat: пул аккаунтов с failover](#gigachat-пул-аккаунтов-с-failover)
   - [OpenAI и совместимые API](#openai-и-совместимые-api)
@@ -35,6 +53,7 @@ CLI-утилита для автоматизации работы на [hh.ru](h
   - [gigachat-accounts](#gigachat-accounts)
   - [config](#config)
   - [Сервисные команды](#сервисные-команды)
+- [Хабр Карьера (career.habr.com)](#хабр-карьера-careerhabrcom)
 - [Решение капчи](#решение-капчи)
 - [Профили (несколько аккаунтов hh.ru)](#профили-несколько-аккаунтов-hhru)
 - [Где хранятся данные](#где-хранятся-данные)
@@ -50,7 +69,7 @@ CLI-утилита для автоматизации работы на [hh.ru](h
 - Python **3.11** или новее.
 - macOS, Linux или Windows (включая WSL).
 - Аккаунт на hh.ru с **опубликованным** резюме.
-- Для AI — либо GigaChat (`GIGACHAT_CREDENTIALS`), либо OpenAI-совместимый API-ключ.
+- Для AI — ключ одного из провайдеров: **Anthropic** (`sk-ant-...`), **GigaChat** или любой **OpenAI-совместимый** API.
 
 ---
 
@@ -59,7 +78,7 @@ CLI-утилита для автоматизации работы на [hh.ru](h
 ### Вариант 1: pipx (для повседневного использования)
 
 ```sh
-pipx install 'hh-applicant-tool[playwright]'
+pipx install 'hh-applicant-tool[playwright] @ git+https://github.com/whatarefuck/hh-gigachat-applicant'
 playwright install chromium
 ```
 
@@ -69,8 +88,8 @@ Extra `playwright` нужен для авторизации (headless Chromium �
 ### Вариант 2: Poetry (для разработки и локальной установки)
 
 ```sh
-git clone https://github.com/s3rgeym/hh-applicant-tool.git
-cd hh-applicant-tool
+git clone https://github.com/whatarefuck/hh-gigachat-applicant.git
+cd hh-gigachat-applicant
 poetry install -E playwright
 poetry run playwright install chromium
 
@@ -116,15 +135,40 @@ hh-applicant-tool -vv apply-vacancies --use-ai --search "Python разработ
 
 ## AI-провайдеры
 
-Утилита поддерживает два провайдера: **GigaChat** (Sber, OAuth2) и любой
-**OpenAI-совместимый** API (OpenAI, OpenRouter, Ollama и т.п.). Провайдер
-выбирается полем `provider` внутри секции конфига:
+Утилита поддерживает три провайдера: **Anthropic Claude**, **GigaChat** (Sber)
+и любой **OpenAI-совместимый** API (OpenAI, OpenRouter, Ollama). Провайдер
+выбирается полем `provider` внутри секции конфига — можно **разные провайдеры
+для разных задач**:
 
-- `openai_cover_letter` — для генерации сопроводительных писем.
-- `openai_vacancy_filter` — для AI-фильтрации вакансий.
-- `openai_captcha` — для распознавания капчи.
+| Секция | Задача |
+|---|---|
+| `openai_cover_letter` | Сопроводительные письма + ответы на тесты hh.ru |
+| `openai_vacancy_filter` | AI-фильтрация вакансий (`--ai-filter`) |
+| `openai_captcha` | Распознавание капчи (Vision) |
 
-Названия секций сохранены `openai_*` ради обратной совместимости.
+> [!TIP]
+> Типичная раскладка: качественный **Claude** на письма и тесты, дешёвый
+> **GigaChat** на массовую фильтрацию вакансий — чтобы не жечь дорогие токены
+> на отсев. См. [Модели для разных задач](#модели-для-разных-задач).
+
+Названия секций исторически начинаются с `openai_*` — это лишь имена, провайдер
+внутри любой.
+
+### Anthropic Claude
+
+Получи ключ на [console.anthropic.com](https://console.anthropic.com/) (`sk-ant-...`):
+
+```sh
+hh-applicant-tool config --set openai_cover_letter.provider anthropic
+hh-applicant-tool config --set openai_cover_letter.api_key 'sk-ant-...'
+hh-applicant-tool config --set openai_cover_letter.model claude-sonnet-4-5
+hh-applicant-tool config --set openai_cover_letter.temperature 0.4
+```
+
+Модели: `claude-opus-4-5` (лучшее качество), `claude-sonnet-4-5` (баланс),
+`claude-haiku-4-5` (дёшево/быстро — норм для фильтра). Claude заметно строже
+следует инструкциям промпта (без эмодзи, штампов, самопрезентаций), поэтому
+письма получаются чище. Поддерживает Vision — годится и для капчи.
 
 ### GigaChat: один аккаунт
 
@@ -154,8 +198,8 @@ hh-applicant-tool gigachat-accounts add --credentials 'OTI3...' --label backup
 
 hh-applicant-tool gigachat-accounts list
 # GigaChat-аккаунтов: 2
-#   [0] main      scope=GIGACHAT_API_PERS  creds=MDE5ZD…0NzQ=
-#   [1] backup    scope=GIGACHAT_API_PERS  creds=OTI3M…WUyZQ==
+# [0] main   scope=GIGACHAT_API_PERS creds=MDE5ZD…0NzQ=
+# [1] backup  scope=GIGACHAT_API_PERS creds=OTI3M…WUyZQ==
 
 hh-applicant-tool gigachat-accounts remove --index 1
 hh-applicant-tool gigachat-accounts clear  # снести все
@@ -195,18 +239,36 @@ hh-applicant-tool config --set openai_cover_letter.proxy_url 'http://user:pass@p
 
 ### Модели для разных задач
 
-Для писем хватает базовой модели, для капчи нужна Vision (Pro/Max):
+Каждая из трёх секций конфига может использовать свой провайдер и модель.
+Рекомендуемая раскладка — качество на письма, дёшево на фильтрацию:
 
 ```sh
-hh-applicant-tool config --set openai_cover_letter.model    GigaChat-2
-hh-applicant-tool config --set openai_vacancy_filter.model  GigaChat-2
-hh-applicant-tool config --set openai_captcha.model         GigaChat-2-Pro
+# Письма + тесты hh.ru — Claude (качество, строгое следование промпту)
+hh-applicant-tool config --set openai_cover_letter.provider anthropic
+hh-applicant-tool config --set openai_cover_letter.api_key  'sk-ant-...'
+hh-applicant-tool config --set openai_cover_letter.model    claude-sonnet-4-5
+
+# Фильтрация вакансий — GigaChat (много дешёвых токенов)
+hh-applicant-tool config --set openai_vacancy_filter.provider gigachat
+hh-applicant-tool config --set openai_vacancy_filter.model    GigaChat-2-Pro
+
+# Капча — Vision-модель (Claude или GigaChat Pro/Max)
+hh-applicant-tool config --set openai_captcha.provider gigachat
+hh-applicant-tool config --set openai_captcha.model    GigaChat-2-Pro
 ```
 
-Vision-модели GigaChat: `GigaChat-Pro`, `GigaChat-Max`, `GigaChat-2-Pro`,
-`GigaChat-2-Max`. На скоупе `GIGACHAT_API_PERS` `Max` иногда недоступна —
-тогда подойдёт `Pro`. Если упадёт `422 Model not found` — переключись на
-другую модель той же линейки.
+**Vision-модели** (для капчи): любой Claude, либо GigaChat `-Pro`/`-Max`
+(`GigaChat-2-Pro`, `GigaChat-2-Max`). Базовый `GigaChat`/`GigaChat-2` Vision
+**не умеет**. Проверить остаток токенов GigaChat по моделям:
+
+```sh
+# access_token GET /api/v1/balance (см. docs GigaChat)
+```
+
+> [!NOTE]
+> На скоупе `GIGACHAT_API_PERS` набор доступных моделей и токенов зависит от
+> аккаунта. Если фильтр падает с `422 Model not found` или упёрся в 0 токенов —
+> переключись на другую модель линейки (`-Pro` ↔ `-Max`).
 
 ---
 
@@ -240,6 +302,18 @@ hh-applicant-tool config --edit
 Когда `bio` задан, секции `Меня зовут:` и `Мой опыт:` из per-vacancy
 промпта автоматически убираются — модель не получает дублирующий
 контекст. Сэкономишь токены.
+
+**Что полезно указать в `bio`**, кроме опыта и стека:
+
+- **ФИО** явно (фамилия + имя), иначе модель иногда выдумывает фамилию.
+- **Локацию и готовность к переезду**: «живу в Москве, готов к переезду в Уфу».
+- **Формат работы**: «удалёнка / гибрид / офис до 5 дней — не важно» или конкретное ограничение.
+- **Зарплатную вилку** и **готовность к выходу** — тогда AI корректно ответит на
+  тестовые вопросы вакансий, а не напишет плейсхолдеры вроде «ХХХ».
+
+Этот же `bio` (и `contacts.faq`) подмешивается в system-prompt **обеих**
+AI-команд — и `apply-vacancies` (письма, ответы на тесты), и
+`reply-employers` (ответы в чате). Меняешь в одном месте — применяется везде.
 
 ### Контакты и FAQ
 
@@ -307,6 +381,8 @@ hh-applicant-tool apply-vacancies [OPTIONS]
 | `--system-prompt "..."` | Свой системный промпт |
 | `--message-prompt "..."` | Свой пользовательский промпт |
 | `--search "..."` | Поисковый запрос |
+| `--area 1` | Регион по **числовому ID** hh.ru (можно несколько через пробел). См. ниже |
+| `--schedule remote` | Формат работы (`remote`, `fullDay`, `flexible`, `shift`) |
 | `--professional-role 96` | Роль (см. `/professional_roles` в HH API) |
 | `--experience between3And6` | Опыт |
 | `--salary 250000 --currency RUR --only-with-salary` | Минимальная зарплата |
@@ -316,6 +392,27 @@ hh-applicant-tool apply-vacancies [OPTIONS]
 | `--resume-id <id>` | Только для конкретного резюме |
 | `--dry-run` | Не отправлять, только показать в логе |
 | `-vv` | DEBUG-логи (`-v` — INFO) |
+
+#### Город / регион (`--area`)
+
+`--area` принимает **числовой ID** региона, а не название. Несколько — через пробел.
+
+```sh
+# Москва
+hh-applicant-tool apply-vacancies --search "Python" --area 1
+
+# Уфа + удалёнка по всей РФ
+hh-applicant-tool apply-vacancies --search "Python" --area 99 --schedule remote
+```
+
+Найти ID любого города:
+
+```sh
+hh-applicant-tool call-api GET /suggests/areas text=Уфа
+```
+
+Частые ID: Москва `1`, Санкт-Петербург `2`, Уфа `99`, Казань `88`,
+Екатеринбург `3`, Новосибирск `4`, вся Россия `113`.
 
 #### Режимы AI-фильтрации
 
@@ -395,6 +492,77 @@ hh-applicant-tool config --show-path                # вывести путь к
 
 ---
 
+## Хабр Карьера (career.habr.com)
+
+Отдельная подсистема для [career.habr.com](https://career.habr.com): находит
+подходящие вакансии, пишет AI-отклик (тот же `cover_letter.bio` + `contacts.faq`,
+что и для hh.ru) и откликается. Может работать фоновым демоном.
+
+У Хабр Карьеры **нет публичного API**, поэтому работа идёт через **Playwright**
+(реальный Google Chrome). Требует extra `playwright` и установленный Chromium/Chrome:
+
+```sh
+poetry install -E playwright
+poetry run playwright install chromium
+```
+
+### Первый вход
+
+```sh
+# Откроется браузер — залогинься в career.habr.com руками (в т.ч. капча/2FA).
+# Сессия сохранится в профиле утилиты, повторный вход не нужен.
+hh-applicant-tool habr-login
+```
+
+Сессия хранится в отдельном браузерном профиле (`habr_browser/` внутри каталога
+профиля утилиты) и переживает перезапуски — как куки в обычном браузере.
+
+### Отклики
+
+```sh
+# Пробный прогон: dry-run ВКЛючён по умолчанию — ничего не отправит,
+# только покажет, что бы сделал. --headful — видеть окно браузера.
+hh-applicant-tool -vv habr-apply --headful
+
+# Разовый боевой прогон (--no-dry-run обязателен для реальной отправки)
+hh-applicant-tool -vv habr-apply --no-dry-run
+
+# Фоновый демон: проверять раз в час и откликаться на новые
+hh-applicant-tool habr-apply --no-dry-run --daemon
+hh-applicant-tool habr-apply --stop   # остановить демон
+```
+
+Команда `habr-apply` (алиасы `habr`, `habr-career`). Флаги:
+
+| Флаг | Назначение |
+|---|---|
+| `--use-ai` / `--no-use-ai` | AI-письмо (по умолчанию вкл) |
+| `--dry-run` / `--no-dry-run` | **По умолчанию `--dry-run`.** Реальная отправка — только с `--no-dry-run` |
+| `--only-suitable` / `--no-only-suitable` | Только «Подходящие» (по профилю Habr) или все вакансии |
+| `--max-pages 3` | Сколько страниц списка обрабатывать |
+| `--limit 20` | Максимум откликов за один прогон |
+| `--headful` | Показывать окно браузера (по умолчанию headless) |
+| `--watch` | Бесконечный цикл в текущем терминале (Ctrl+C — стоп) |
+| `--daemon` / `--stop` | Фоновый демон / его остановка |
+| `--interval 3600` | Пауза между прогонами (сек, по умолчанию 1 час) |
+| `--system-prompt` / `--message-prompt` | Свои промпты |
+
+**Как это работает:**
+
+- Дедуп: ID вакансий, на которые откликнулись, пишутся в `habr_applied.json` —
+  повторно на ту же вакансию не откликнется.
+- Между откликами имитирует человеческую активность (случайный сёрфинг/скролл),
+  чтобы снизить «ботоподобность».
+- Playwright маскируется под настоящий Chrome (без флагов автоматизации,
+  скрыт `navigator.webdriver`) — иначе Хабр ловит капча-луп.
+
+> [!WARNING]
+> `habr-apply` шлёт реальные отклики на твой аккаунт career.habr.com. Сначала
+> прогоняй с дефолтным `--dry-run --headful` и убедись, что письма и выбор
+> вакансий адекватны. `--limit` защищает от массового спама за один прогон.
+
+---
+
 ## Решение капчи
 
 Если hh.ru возвращает капчу (на отклике, запросе вакансии или просмотре
@@ -454,6 +622,9 @@ hh-applicant-tool --profile work apply-vacancies --use-ai
 | `cookies.txt` | Куки в Mozilla-формате |
 | `hh.sqlite` | Локальная БД (отклики, контакты, пропущенные вакансии) |
 | `hh-applicant-tool.log` | Лог приложения |
+| `habr_browser/` | Браузерный профиль career.habr.com (сессия/куки Хабра) |
+| `habr_applied.json` | ID вакансий Хабра, на которые уже откликнулись |
+| `habr-apply.pid` | PID фонового демона `habr-apply` |
 
 Переопределить корень: `--config-dir <path>` или `CONFIG_DIR=<path>`.
 
@@ -556,4 +727,6 @@ Limited Non-Commercial License. См. файл `LICENSE`.
 
 Бесплатно для личного использования. Коммерческое использование —
 включая интеграцию в платные сервисы или перепродажу — запрещено.
-Based on github.com/s3rgeym/hh-applicant-tool
+
+Форк проекта [s3rgeym/hh-applicant-tool](https://github.com/s3rgeym/hh-applicant-tool)
+с поддержкой GigaChat, Anthropic Claude и Хабр Карьеры.

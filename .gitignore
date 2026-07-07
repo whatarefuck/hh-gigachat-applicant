@@ -86,3 +86,6 @@ CLAUDE.md
 .codex/
 uv.lock
 poetry.lock
+
+# macOS
+.DS_Store

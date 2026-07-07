@@ -2,27 +2,28 @@
 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
 SHELL=/bin/bash
 
-# При старте контейнера — прогреть сессию и проверить токен.
+# ВАЖНО: HH использует ОДНОРАЗОВЫЕ refresh-токены. Два процесса, стартующих
+# одновременно, прочитают один и тот же refresh-токен, и второй упадёт с
+# 'token has already been refreshed'. Поэтому задачи РАЗНЕСЕНЫ по минутам,
+# чтобы не пересекаться. Не запускай команды вручную, пока работает cron.
+
+# При старте контейнера — прогреть сессию (refresh + первая рассылка).
 @reboot /bin/bash /app/startup.sh >> /var/log/cron.log 2>&1
 
-# Поднимать резюме каждые 5 часов (имитация рандомного интервала через sleep,
-# чтобы антиспам HH не сработал).
-0 */5 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool update-resumes >> /var/log/cron.log 2>&1
+# Поднимать резюме каждые 5 часов (на 15-й минуте).
+15 */5 * * * /bin/bash -c 'sleep $((RANDOM \% 60))' && /usr/local/bin/python -m hh_applicant_tool update-resumes >> /var/log/cron.log 2>&1
 
-# Рассылка откликов с AI-генерацией писем и AI-фильтром, в часы работы (8-21 MSK).
-# --force-message: писать GigaChat'у на все вакансии (а не только обязательные).
-# --ai-filter light: GigaChat решает, подходит ли вакансия (экономит дневной лимит).
-# Стоп-слова — junior, тестовое, web3/crypto и т.п. — отсеять перед AI.
-0 8-21 * * * /bin/bash -c 'sleep $((60 + RANDOM \% 241))' && /usr/local/bin/python -m hh_applicant_tool apply-vacancies --use-ai --force-message --ai-filter light --excluded-filter 'junior|стажировк|bitrix|web3|crypto|blockchain|тестов\w+ задан|soft skill' >> /var/log/cron.log 2>&1
+# Рассылка откликов с AI — на 0-й минуте, в часы работы (8-21 MSK).
+# --force-message: письмо на все вакансии. --ai-filter light: AI-отсев.
+0 8-21 * * * /bin/bash -c 'sleep $((RANDOM \% 120))' && /usr/local/bin/python -m hh_applicant_tool apply-vacancies --use-ai --force-message --ai-filter light --excluded-filter 'junior|стажировк|bitrix|web3|crypto|blockchain|тестов\w+ задан|soft skill' >> /var/log/cron.log 2>&1
 
-# Ответы работодателям в чатах + чистка отказов и заблокированных.
-# Каждый час с 9 до 22 (даём работодателям шанс ответить за ночь).
-0 9-22 * * * /bin/bash -c 'sleep $((30 + RANDOM \% 121))' && /usr/local/bin/python -m hh_applicant_tool reply-employers --use-ai --only-invitations --delete-discarded --delete-blacklisted >> /var/log/cron.log 2>&1
+# Ответы работодателям + чистка отказов/блокировок — на 30-й минуте (9-22),
+# с полчаса смещением от apply-vacancies, чтобы не делить refresh-токен.
+30 9-22 * * * /bin/bash -c 'sleep $((RANDOM \% 60))' && /usr/local/bin/python -m hh_applicant_tool reply-employers --use-ai --only-invitations --delete-discarded --delete-blacklisted >> /var/log/cron.log 2>&1
 
-# Чистая чистка (без AI-ответов) — раз в сутки в полночь. На случай если
-# reply-employers выше упал/был отключён.
-0 0 * * * /usr/local/bin/python -m hh_applicant_tool reply-employers --delete-discarded --delete-blacklisted >> /var/log/cron.log 2>&1
+# Ночная чистка отказов (без AI) — раз в сутки, на 45-й минуте.
+45 3 * * * /usr/local/bin/python -m hh_applicant_tool reply-employers --delete-discarded --delete-blacklisted >> /var/log/cron.log 2>&1
 
-# Принудительный refresh токена каждые 30 минут. Обычно не нужен (токен
-# обновляется автоматически при любом запросе), но не мешает.
-*/30 * * * * /usr/local/bin/python -m hh_applicant_tool refresh-token >> /var/log/cron.log 2>&1
+# Отдельный refresh-token по крону НЕ нужен: токен обновляется автоматически
+# при любом запросе. Принудительный refresh лишь создаёт гонку за одноразовый
+# refresh-токен и ломает соседние задачи.
