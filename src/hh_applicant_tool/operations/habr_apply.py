@@ -54,6 +54,7 @@ class Namespace(BaseNamespace):
     interval: int
     headful: bool
     limit: int
+    no_apply: bool
 
 
 class Operation(BaseOperation):
@@ -106,6 +107,15 @@ class Operation(BaseOperation):
             type=int,
             default=20,
             help="Максимум откликов за один прогон (по умолчанию 20).",
+        )
+        parser.add_argument(
+            "--no-apply",
+            "--activity-only",
+            "--imitate-only",
+            action="store_true",
+            default=False,
+            help="Только имитация активности (сёрфинг/скролл), БЕЗ откликов на "
+            "вакансии. Держит аккаунт «живым». Хорошо сочетается с --daemon.",
         )
         parser.add_argument(
             "--dry-run",
@@ -248,13 +258,18 @@ class Operation(BaseOperation):
             "https"
         ) or tool._get_proxies().get("https")
 
+        # В режиме --no-apply AI не нужен (письма не генерируются).
         self.cover_letter_ai = (
             tool.get_cover_letter_ai(self._build_system_prompt(args.system_prompt))
-            if args.use_ai
+            if args.use_ai and not args.no_apply
             else None
         )
 
-        if args.dry_run:
+        if args.no_apply:
+            logger.info(
+                "habr-apply: режим ТОЛЬКО ИМИТАЦИЯ АКТИВНОСТИ (без откликов)."
+            )
+        elif args.dry_run:
             logger.info("habr-apply: DRY-RUN — отклики НЕ отправляются.")
 
         loop_mode = args.watch or args.daemon
@@ -295,6 +310,19 @@ class Operation(BaseOperation):
             proxy_url=self.proxy_url,
         ) as client:
             await client.ensure_login()
+
+            # Режим «только активность»: сёрфим, но не откликаемся.
+            if self.args.no_apply:
+                rounds = random.randint(2, 4)
+                logger.info(
+                    "habr-apply: режим имитации активности (%d раунда, без откликов).",
+                    rounds,
+                )
+                for _ in range(rounds):
+                    await client.imitate_activity()
+                    await asyncio.sleep(random.uniform(4.0, 12.0))
+                logger.info("habr-apply: имитация активности завершена.")
+                return
 
             ids = await client.fetch_vacancy_ids(
                 search=self.args.search,

@@ -48,6 +48,8 @@ class Namespace(BaseNamespace):
     period: int
     delete_discarded: bool
     delete_blacklisted: bool
+    delete_archived: bool
+    cleanup: bool
     watch: bool
     interval: int
     daemon: bool
@@ -109,6 +111,20 @@ class Operation(BaseOperation):
             help="Отменять отклик и удалять чат с работодателями из чёрного списка",
             default=False,
             action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--delete-archived",
+            help="Удалять чат, если вакансия ушла в архив (неактуальна)",
+            default=False,
+            action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--cleanup",
+            "--delete-irrelevant",
+            action="store_true",
+            default=False,
+            help="Почистить все неактуальные чаты: отказы + архивные вакансии + "
+            "чёрный список (включает --delete-discarded/-archived/-blacklisted).",
         )
         parser.add_argument(
             "--use-ai",
@@ -302,8 +318,10 @@ class Operation(BaseOperation):
         self.max_pages = args.max_pages
         self.dry_run = args.dry_run
         self.only_invitations = args.only_invitations
-        self.delete_discarded = args.delete_discarded
-        self.delete_blacklisted = args.delete_blacklisted
+        # --cleanup — зонтичный флаг: включает все виды чистки сразу.
+        self.delete_discarded = args.delete_discarded or args.cleanup
+        self.delete_blacklisted = args.delete_blacklisted or args.cleanup
+        self.delete_archived = args.delete_archived or args.cleanup
 
         self.message_prompt = args.message_prompt
 
@@ -520,6 +538,17 @@ class Operation(BaseOperation):
                             nid=nid,
                             vacancy=vacancy,
                             reason="отказ работодателя",
+                            send_decline=False,
+                        )
+                    continue
+
+                # Вакансия ушла в архив — чат неактуален.
+                if vacancy.get("archived"):
+                    if self.delete_archived:
+                        self._cleanup_chat(
+                            nid=nid,
+                            vacancy=vacancy,
+                            reason="вакансия в архиве",
                             send_decline=False,
                         )
                     continue

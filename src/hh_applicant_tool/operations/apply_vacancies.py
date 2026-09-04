@@ -568,28 +568,33 @@ class Operation(BaseOperation):
                     self._solve_captcha_async(ex.captcha_url)
                 )
             except Exception as solve_ex:
+                # Капча-AI недоступен (нет токенов и т.п.) — НЕ роняем прогон.
+                # Возвращаем None: письмо соберётся из snippet, цикл продолжится,
+                # а в конце напечатается итог «Отправлено: N».
                 logger.error(
-                    "Ошибка при решении капчи для /vacancies/%s: %s",
+                    "Ошибка при решении капчи для /vacancies/%s: %s — "
+                    "продолжаю без полного описания.",
                     vacancy_id,
                     solve_ex,
                 )
-                raise
+                return None
             if not solved:
                 logger.warning(
-                    "Не удалось решить капчу для /vacancies/%s — скип",
+                    "Не удалось решить капчу для /vacancies/%s — продолжаю без "
+                    "полного описания.",
                     vacancy_id,
                 )
-                raise
+                return None
             # После успешного решения куки уже скопированы в self.tool.session,
             # повторяем запрос один раз.
             try:
                 return self.api_client.get(f"/vacancies/{vacancy_id}")
             except CaptchaRequired:
                 logger.warning(
-                    "Капча для /vacancies/%s повторно — скип вакансии",
+                    "Капча для /vacancies/%s повторно — продолжаю без описания.",
                     vacancy_id,
                 )
-                raise
+                return None
         except Exception as ex:
             logger.warning(
                 "Не удалось получить полную вакансию %s: %s", vacancy_id, ex
